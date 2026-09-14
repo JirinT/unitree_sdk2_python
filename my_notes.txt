@@ -1,0 +1,13 @@
+UNITREE H1_2 connect and set ip:
+1. connect the dongle
+2. ip link show - should show something like enx00e04c68005c
+3. sudo ip link set enx00e04c68005c up (bring the interface up)
+4. ip link show enx00e04c68005c - check LOWER_UP in the flags! thatss the actual signal the robot is connected and it iss powered on, not just that the interface exists.
+5. sudo ip addr add 192.168.123.99/24 dev enx00e04c68005c - Re-assign the static IP
+6. ping 192.168.123.164 - pings the robot!
+
+
+---- BALANCING TRAY ---- :
+Initial Roll: 0.004 rad 
+Maximal Roll: 0.047 rad
+Minimal Roll: -0.066 rad
