@@ -52,9 +52,10 @@ POSITION_DURATION = 4.0 # seconds
 # ZERO_ELBOW = 1.48
 ZERO_ELBOW = 1.3  # rad, elbow angle when arm is straight down
 
-GAIN = 1.5
-SIGN_PITCH = 1.0
-FILTER_ALPHA = .3
+GAIN = 1.0              # proportional gain on torso pitch angle error
+RATE_GAIN = 0.2         # s, derivative gain on torso pitch angular velocity (damping)
+SIGN_PITCH = -1.0
+FILTER_ALPHA = .5       # low-pass on both filtered_pitch and filtered_pitch_rate
 
 UPPER_ARM_LENGTH = 0.3425   # m, shoulder to elbow
 FOREARM_LENGTH = 0.3425     # m, elbow to hand
@@ -116,7 +117,8 @@ class Custom:
         self.low_state = None
         self.crc = CRC()
 
-        self.filtered_pitch = 0.0     # seeded from the first real reading, see LowStateHandler
+        self.filtered_pitch = 0.0       # seeded from the first real reading, see LowStateHandler
+        self.filtered_pitch_rate = 0.0  # low-pass filtered torso pitch angular velocity (rad/s)
 
         self.shoulder_start = None       # frozen at the phase1 / phase2 transition
         self.elbow_start = None          # frozen at the phase1 / phase2 transition
@@ -175,9 +177,14 @@ class Custom:
             elbow_target = elbow_start + (ELBOW_TARGET_POS - elbow_start) * ratio
             shoulder_target = shoulder_start + (SHOULDER_TARGET_POS - shoulder_start) * ratio
 
+            # constant-slope feed-forward velocity during the linear ramp
+            elbow_vel = (ELBOW_TARGET_POS - elbow_start) / POSITION_DURATION
+            shoulder_vel = (SHOULDER_TARGET_POS - shoulder_start) / POSITION_DURATION
+
         else:
-            # 2. IMU pitch compensation
+            # 2. IMU pitch compensation: P on angle error, D on angular velocity
             pitch = pitch_from_quaternion(self.low_state.imu_state.quaternion)
+            pitch_rate = self.low_state.imu_state.gyroscope[1]
 
             if not self.phase2_entered:
                 self.phase2_entered = True
@@ -185,13 +192,21 @@ class Custom:
                 self.elbow_start = ELBOW_TARGET_POS
                 self.pitch_zero = pitch
                 self.filtered_pitch = pitch
+                self.filtered_pitch_rate = pitch_rate
 
             self.filtered_pitch += FILTER_ALPHA * (pitch - self.filtered_pitch)
+            self.filtered_pitch_rate += FILTER_ALPHA * (pitch_rate - self.filtered_pitch_rate)
             delta_pitch = self.filtered_pitch - self.pitch_zero
 
-            correction_target = clamp(-SIGN_PITCH * GAIN * delta_pitch, -MAX_CORRECTION, MAX_CORRECTION)
+            correction_target = clamp(
+                -SIGN_PITCH * (GAIN * delta_pitch + RATE_GAIN * self.filtered_pitch_rate),
+                -MAX_CORRECTION, MAX_CORRECTION
+            )
             elbow_correction_target = ELBOW_SHARE * correction_target
             shoulder_correction_target = (1.0 - ELBOW_SHARE) * correction_target
+
+            prev_elbow_correction = self.elbow_correction
+            prev_shoulder_correction = self.shoulder_correction
 
             max_elbow_step = MAX_ELBOW_CORRECTION_RATE * CONTROL_DT
             self.elbow_correction += clamp(
@@ -205,6 +220,10 @@ class Custom:
             shoulder_target = self.shoulder_start + self.shoulder_correction
             elbow_target = self.elbow_start + self.elbow_correction
 
+            # feed-forward velocity = the correction step actually applied this tick
+            elbow_vel = (self.elbow_correction - prev_elbow_correction) / CONTROL_DT
+            shoulder_vel = (self.shoulder_correction - prev_shoulder_correction) / CONTROL_DT
+
         self.low_cmd.mode_pr = Mode.PR
         self.low_cmd.mode_machine = self.mode_machine_
 
@@ -215,8 +234,10 @@ class Custom:
 
             if i == H1_2_JointIndex.LeftElbow:
                 self.low_cmd.motor_cmd[i].q = elbow_target
+                self.low_cmd.motor_cmd[i].dq = elbow_vel
             elif i == H1_2_JointIndex.LeftShoulderPitch:
                 self.low_cmd.motor_cmd[i].q = shoulder_target
+                self.low_cmd.motor_cmd[i].dq = shoulder_vel
             else:
                 self.low_cmd.motor_cmd[i].q = self.q_start[i]
 
@@ -237,6 +258,7 @@ class Custom:
             print(
                 f"shoulder={shoulder_target:+.3f}  elbow={elbow_target:+.3f}  "
                 f"delta_pitch={self.filtered_pitch - self.pitch_zero:+.3f}  "
+                f"pitch_rate={self.filtered_pitch_rate:+.3f}  "
                 f"hand=(x={hand_x:+.4f}, z={hand_z:+.4f})"
             )
 
