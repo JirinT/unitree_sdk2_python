@@ -17,6 +17,7 @@ import time
 import numpy as np
 
 from deploy_sim_teleop import CONTROL_DT, PolicyRunner
+from physical_reach import estimate_reach
 
 
 def smoothstep(u):
@@ -76,6 +77,25 @@ def make_stages(boxes, velocity_ranges, rest, time_scale=1.):
         stage("both_return_release", 4, 2, [0, 0, 0], rest, [1, 1], (0, 1)),
         stage("stand_finish", 1, 3, [0, 0, 0], rest, [0, 0]),
     ]
+
+
+def add_physical_reach(stages, boxes, goals, time_scale=1.):
+    """Progressively request full FK-estimated limits, then repeat in walking."""
+    center = np.asarray(boxes).mean(axis=2)
+    extra = [Stage("maxreach_stop", 4*time_scale, 3*time_scale,
+                   np.zeros(3), center.copy(), np.ones(2))]
+    for direction in ("forward", "outward", "up"):
+        for fraction in (.25, .5, .75, 1.):
+            target = center+fraction*(goals[direction]-center)
+            extra.append(Stage(f"maxreach_{direction}_{int(fraction*100)}", 5*time_scale, 3*time_scale,
+                               np.zeros(3), target, np.ones(2)))
+        extra.append(Stage(f"maxreach_{direction}_recenter", 4*time_scale, 2*time_scale,
+                           np.zeros(3), center.copy(), np.ones(2)))
+    extra.append(Stage("walk_maxreach_forward", 6*time_scale, 4*time_scale,
+                       np.array([.2, 0., 0.]), goals["forward"].copy(), np.ones(2)))
+    # Existing stop/return/release stages finish the run.
+    index = next(i for i, stage in enumerate(stages) if stage.name == "stop_and_center")
+    return stages[:index]+extra+stages[index:]
 
 
 class Sequence:
@@ -140,16 +160,18 @@ class Report:
         self.writer.writerow(["time_s", "stage", "vx_cmd", "vy_cmd", "yaw_rate_cmd", "left_enabled", "right_enabled",
                               *[f"{side}_{kind}_{axis}" for kind in ("target", "palm") for side in ("left", "right") for axis in "xyz"],
                               "left_error_m", "right_error_m", "pelvis_tilt_deg", "palm_speed_max_m_s",
-                              "action_rate_rms_s", "joint_target_rate_rms_rad_s", "settled"])
+                              "action_rate_rms_s", "joint_target_rate_rms_rad_s", "settled",
+                              "left_shoulder_extension_m", "right_shoulder_extension_m"])
         self.by_stage = {s.name: dict(samples=0, left=[], right=[], settled_left=[], settled_right=[],
-                                     tilt=[], palm_speed=[], action_rate=[], joint_target_rate=[]) for s in stages}
+                                     tilt=[], palm_speed=[], action_rate=[], joint_target_rate=[], left_extension=[], right_extension=[]) for s in stages}
         self.metadata = metadata
         self.previous = None
         self.sample_count = 0
 
-    def add(self, t, sample, obs, action, target_q, dt):
+    def add(self, t, sample, obs, action, target_q, dt, shoulders=None):
         palms = obs[38:44].reshape(2, 3).astype(float)
         errors = np.linalg.norm(sample["palms"]-palms, axis=1)
+        extension = None if shoulders is None else np.linalg.norm(palms-shoulders, axis=1)
         g = obs[3:6].astype(float)
         tilt = math.degrees(math.acos(float(np.clip(-g[2]/np.linalg.norm(g), -1, 1))))
         palm_speed = action_rate = joint_rate = 0.
@@ -164,14 +186,17 @@ class Report:
         for side, name in enumerate(("left", "right")):
             if sample["masks"][side]:
                 bucket[name].append(float(errors[side]))
+                if extension is not None:
+                    bucket[name+"_extension"].append(float(extension[side]))
                 if sample["settled"]:
                     bucket["settled_"+name].append(float(errors[side]))
         for name, value in (("tilt", tilt), ("palm_speed", palm_speed), ("action_rate", action_rate), ("joint_target_rate", joint_rate)):
             bucket[name].append(value)
         error_fields = [float(errors[s]) if sample["masks"][s] else "" for s in range(2)]
+        extension_fields = [float(extension[s]) if extension is not None and sample["masks"][s] else "" for s in range(2)]
         self.writer.writerow([t, sample["stage"], *sample["velocity"], *sample["masks"],
                               *sample["palms"].ravel(), *palms.ravel(), *error_fields, tilt,
-                              palm_speed, action_rate, joint_rate, int(sample["settled"])])
+                              palm_speed, action_rate, joint_rate, int(sample["settled"]), *extension_fields])
         self.sample_count += 1
         if self.sample_count % 50 == 0:
             self.stream.flush()
@@ -186,6 +211,8 @@ class Report:
             report["stages"][name] = {"samples": values["samples"],
                 "left_error_m": stats(values["left"]), "right_error_m": stats(values["right"]),
                 "settled_left_error_m": stats(values["settled_left"]), "settled_right_error_m": stats(values["settled_right"]),
+                "left_shoulder_extension_m": stats(values["left_extension"]),
+                "right_shoulder_extension_m": stats(values["right_extension"]),
                 "pelvis_tilt_deg": stats(values["tilt"]), "palm_speed_max_m_s": stats(values["palm_speed"]),
                 "action_rate_rms_s": stats(values["action_rate"]), "joint_target_rate_rms_rad_s": stats(values["joint_target_rate"])}
         (self.output/"summary.json").write_text(json.dumps(report, indent=2, allow_nan=False)+"\n")
@@ -195,17 +222,25 @@ class Report:
 
 class EvaluationRunner(PolicyRunner):
     def __init__(self, deploy_yaml, onnx_path, output, time_scale=1., robot_xml=None,
-                 abort_tilt_deg=60., tilt_grace_s=.25, state_timeout=1.):
+                 abort_tilt_deg=60., tilt_grace_s=.25, state_timeout=1.,
+                 reach_profile="physical", reach_samples=8192, reach_seed=7):
         super().__init__(deploy_yaml, onnx_path, simulation=True, robot_xml=robot_xml)
         if (not 0 < abort_tilt_deg < 180 or not math.isfinite(tilt_grace_s) or tilt_grace_s < 0
                 or not math.isfinite(state_timeout) or state_timeout <= 0):
             raise ValueError("Invalid tilt or LowState timeout settings")
         rest, _ = self.fk.compute(self.default_q)
         self.stages = make_stages(self.controls.boxes, self.controls.velocity_ranges, rest, time_scale)
+        reach_info = None
+        if reach_profile == "physical":
+            goals, reach_info = estimate_reach(self.fk, self.default_q, self.joint_names, reach_samples, reach_seed)
+            self.stages = add_physical_reach(self.stages, self.controls.boxes, goals, time_scale)
+        elif reach_profile != "standard":
+            raise ValueError("reach_profile must be physical or standard")
         self.sequence = Sequence(self.stages, rest)
         self.report = Report(output, self.stages, dict(policy=str(Path(onnx_path).resolve()),
             deploy_yaml=str(Path(deploy_yaml).resolve()), controller_dt=self.step_dt,
             scenario_duration_s=self.sequence.duration, time_scale=time_scale,
+            reach_profile=reach_profile, physical_reach_estimates=reach_info,
             abort_tilt_deg=abort_tilt_deg, tilt_grace_s=tilt_grace_s, state_timeout_s=state_timeout))
         self.abort_tilt_deg, self.tilt_grace_s = abort_tilt_deg, tilt_grace_s
         self.state_timeout = state_timeout
@@ -244,7 +279,11 @@ class EvaluationRunner(PolicyRunner):
             self.controls.targets[:] = sample["palms"]
             self.controls.masks[:] = sample["masks"]
         super().infer()
-        tilt = self.report.add(t, sample, self.last_obs, self.last_action, self.target_q, self.step_dt)
+        data, model = self.fk.data, self.fk.model
+        rotation = data.xmat[self.fk.root].reshape(3, 3)
+        shoulders = np.stack([(data.xpos[model.body(side+"_shoulder_pitch_link").id]-data.xpos[self.fk.root]) @ rotation
+                              for side in ("left", "right")])
+        tilt = self.report.add(t, sample, self.last_obs, self.last_action, self.target_q, self.step_dt, shoulders)
         self.tilt_time = self.tilt_time+self.step_dt if tilt >= self.abort_tilt_deg else 0.
         if tilt >= self.abort_tilt_deg and self.tilt_time >= self.tilt_grace_s:
             raise RuntimeError(f"Sustained pelvis tilt {tilt:.1f} degrees exceeded evaluation threshold")
@@ -258,6 +297,10 @@ def main():
     parser.add_argument("deploy_yaml")
     parser.add_argument("onnx_path")
     parser.add_argument("--robot-xml")
+    parser.add_argument("--reach-profile", choices=("physical", "standard"), default="physical",
+                        help="physical adds progressive reaches beyond training boxes; standard keeps original protocol")
+    parser.add_argument("--reach-samples", type=int, default=8192, help="FK samples per arm to estimate directional reach limits")
+    parser.add_argument("--reach-seed", type=int, default=7)
     parser.add_argument("--time-scale", type=float, default=1., help="Multiply all move/hold times; 1.5 is slower")
     parser.add_argument("--output", default=None, help="Results directory (default: evaluation_results/timestamp)")
     parser.add_argument("--abort-tilt-deg", type=float, default=60.)
@@ -269,6 +312,11 @@ def main():
         base = PolicyRunner(args.deploy_yaml, args.onnx_path, simulation=True, robot_xml=args.robot_xml)
         rest, _ = base.fk.compute(base.default_q)
         stages = make_stages(base.controls.boxes, base.controls.velocity_ranges, rest, args.time_scale)
+        if args.reach_profile == "physical":
+            goals, info = estimate_reach(base.fk, base.default_q, base.joint_names, args.reach_samples, args.reach_seed)
+            stages = add_physical_reach(stages, base.controls.boxes, goals, args.time_scale)
+            for direction, goal in info["goals"].items():
+                print(f"Estimated {direction} palms (pelvis m): {np.round(goal['palms_pelvis_m'], 3).tolist()}")
         sequence = Sequence(stages, rest)
         for t in np.arange(0., sequence.duration+base.step_dt, base.step_dt):
             sample = sequence.sample(t, rest)
@@ -278,7 +326,8 @@ def main():
         return
     output = args.output or str(Path("evaluation_results")/datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     runner = EvaluationRunner(args.deploy_yaml, args.onnx_path, output, args.time_scale, args.robot_xml,
-                              args.abort_tilt_deg, args.tilt_grace_s, args.state_timeout)
+                              args.abort_tilt_deg, args.tilt_grace_s, args.state_timeout,
+                              args.reach_profile, args.reach_samples, args.reach_seed)
     status, reason = "interrupted", None
     try:
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
