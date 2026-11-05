@@ -16,7 +16,7 @@ import time
 
 import numpy as np
 
-from deploy_sim_teleop import CONTROL_DT, PolicyRunner
+from deploy_sim_teleop import CONTROL_DT, RAMP_DURATION, PolicyRunner
 from physical_reach import estimate_reach
 
 
@@ -77,6 +77,41 @@ def make_stages(boxes, velocity_ranges, rest, time_scale=1.):
         stage("both_return_release", 4, 2, [0, 0, 0], rest, [1, 1], (0, 1)),
         stage("stand_finish", 1, 3, [0, 0, 0], rest, [0, 0]),
     ]
+
+
+def make_demo_stages(boxes, velocity_ranges, rest, time_scale=1.):
+    """A grasp/carry/place gesture in <15 controller seconds including startup.
+
+    Palm positioning only: no fingers, object contact, grasp planner, or IK.
+    Leave 0.2 s below the cap for the final policy/control sample.
+    """
+    if not math.isfinite(time_scale) or time_scale <= 0:
+        raise ValueError("Demo time scale must be finite and positive")
+    boxes = np.asarray(boxes)
+    low, width = boxes[:, :, 0], boxes[:, :, 1]-boxes[:, :, 0]
+    grasp = low + width*np.array([[.65, .08, .40], [.65, .92, .40]])
+    carry = low + width*np.array([[.50, .08, .70], [.50, .92, .70]])
+    place = low + width*np.array([[.80, .08, .20], [.80, .92, .20]])
+    velocity = np.array([.25, 0., 0.])
+    limits = np.asarray(velocity_ranges)
+    if (velocity < limits[:, 0]).any() or (velocity > limits[:, 1]).any():
+        raise ValueError("Demo walking velocity is outside configured limits")
+    def stage(name, move, hold, command, palms, masks, disable=()):
+        return Stage(name, move*time_scale, hold*time_scale, np.asarray(command, dtype=float),
+                     np.array(palms, dtype=float), np.array(masks, dtype=float), disable)
+    stages = [
+        stage("demo_stand", .2, .4, [0, 0, 0], rest, [0, 0]),
+        stage("demo_reach_to_grasp", 1.6, .3, [0, 0, 0], grasp, [1, 1]),
+        stage("demo_lift_to_carry", .8, .2, [0, 0, 0], carry, [1, 1]),
+        stage("demo_walk_carrying", .8, 1.4, velocity, carry, [1, 1]),
+        stage("demo_stop", .8, .4, [0, 0, 0], carry, [1, 1]),
+        stage("demo_place", 1.2, .3, [0, 0, 0], place, [1, 1]),
+        stage("demo_withdraw_release", 1.4, .2, [0, 0, 0], rest, [1, 1], (0, 1)),
+        stage("demo_stand_finish", .2, .6, [0, 0, 0], rest, [0, 0]),
+    ]
+    if RAMP_DURATION+sum(s.move_s+s.hold_s for s in stages) > 14.8+1e-9:
+        raise ValueError("Demo exceeds its 15-second budget including startup; use --time-scale <= 1")
+    return stages
 
 
 def add_physical_reach(stages, boxes, goals, time_scale=1.):
@@ -229,17 +264,21 @@ class EvaluationRunner(PolicyRunner):
                 or not math.isfinite(state_timeout) or state_timeout <= 0):
             raise ValueError("Invalid tilt or LowState timeout settings")
         rest, _ = self.fk.compute(self.default_q)
-        self.stages = make_stages(self.controls.boxes, self.controls.velocity_ranges, rest, time_scale)
+        if reach_profile == "demo":
+            self.stages = make_demo_stages(self.controls.boxes, self.controls.velocity_ranges, rest, time_scale)
+        else:
+            self.stages = make_stages(self.controls.boxes, self.controls.velocity_ranges, rest, time_scale)
         reach_info = None
         if reach_profile == "physical":
             goals, reach_info = estimate_reach(self.fk, self.default_q, self.joint_names, reach_samples, reach_seed)
             self.stages = add_physical_reach(self.stages, self.controls.boxes, goals, time_scale)
-        elif reach_profile != "standard":
-            raise ValueError("reach_profile must be physical or standard")
+        elif reach_profile not in {"standard", "demo"}:
+            raise ValueError("reach_profile must be physical, standard, or demo")
         self.sequence = Sequence(self.stages, rest)
         self.report = Report(output, self.stages, dict(policy=str(Path(onnx_path).resolve()),
             deploy_yaml=str(Path(deploy_yaml).resolve()), controller_dt=self.step_dt,
             scenario_duration_s=self.sequence.duration, time_scale=time_scale,
+            nominal_total_s=RAMP_DURATION+self.sequence.duration,
             reach_profile=reach_profile, physical_reach_estimates=reach_info,
             abort_tilt_deg=abort_tilt_deg, tilt_grace_s=tilt_grace_s, state_timeout_s=state_timeout))
         self.abort_tilt_deg, self.tilt_grace_s = abort_tilt_deg, tilt_grace_s
@@ -292,13 +331,13 @@ class EvaluationRunner(PolicyRunner):
             self.stop_event.set()
 
 
-def main():
+def main(default_profile="physical"):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("deploy_yaml")
     parser.add_argument("onnx_path")
     parser.add_argument("--robot-xml")
-    parser.add_argument("--reach-profile", choices=("physical", "standard"), default="physical",
-                        help="physical adds progressive reaches beyond training boxes; standard keeps original protocol")
+    parser.add_argument("--reach-profile", choices=("physical", "standard", "demo"), default=default_profile,
+                        help="physical: reach stress test; standard: original protocol; demo: grasp/carry/place in under 15 s including startup")
     parser.add_argument("--reach-samples", type=int, default=8192, help="FK samples per arm to estimate directional reach limits")
     parser.add_argument("--reach-seed", type=int, default=7)
     parser.add_argument("--time-scale", type=float, default=1., help="Multiply all move/hold times; 1.5 is slower")
@@ -311,7 +350,10 @@ def main():
     if args.validate_only:
         base = PolicyRunner(args.deploy_yaml, args.onnx_path, simulation=True, robot_xml=args.robot_xml)
         rest, _ = base.fk.compute(base.default_q)
-        stages = make_stages(base.controls.boxes, base.controls.velocity_ranges, rest, args.time_scale)
+        if args.reach_profile == "demo":
+            stages = make_demo_stages(base.controls.boxes, base.controls.velocity_ranges, rest, args.time_scale)
+        else:
+            stages = make_stages(base.controls.boxes, base.controls.velocity_ranges, rest, args.time_scale)
         if args.reach_profile == "physical":
             goals, info = estimate_reach(base.fk, base.default_q, base.joint_names, args.reach_samples, args.reach_seed)
             stages = add_physical_reach(stages, base.controls.boxes, goals, args.time_scale)
@@ -322,7 +364,7 @@ def main():
             sample = sequence.sample(t, rest)
             assert np.isfinite(sample["palms"]).all() and np.isfinite(sample["velocity"]).all()
         base.validate()
-        print(f"Offline trajectory OK: {len(stages)} stages, {sequence.duration:.1f}s plus startup ramp; no physical rollout")
+        print(f"Offline trajectory OK: {len(stages)} stages, {sequence.duration:.1f}s + {RAMP_DURATION:.1f}s startup = {sequence.duration+RAMP_DURATION:.1f}s nominal; no physical rollout")
         return
     output = args.output or str(Path("evaluation_results")/datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     runner = EvaluationRunner(args.deploy_yaml, args.onnx_path, output, args.time_scale, args.robot_xml,
