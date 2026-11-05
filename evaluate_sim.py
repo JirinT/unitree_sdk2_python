@@ -80,38 +80,45 @@ def make_stages(boxes, velocity_ranges, rest, time_scale=1.):
 
 
 def make_demo_stages(boxes, velocity_ranges, rest, time_scale=1.):
-    """A grasp/carry/place gesture in <15 controller seconds including startup.
+    """Expressive approach/grasp/lift/carry/place gesture (~27 s with startup).
 
-    Palm positioning only: no fingers, object contact, grasp planner, or IK.
-    Leave 0.2 s below the cap for the final policy/control sample.
+    All task goals use the trained box, with a wide approach and release, full
+    forward extension, and a large vertical lift. Fingers/object contact and IK
+    are not part of this position-only policy. time_scale >1 is allowed.
     """
     if not math.isfinite(time_scale) or time_scale <= 0:
         raise ValueError("Demo time scale must be finite and positive")
     boxes = np.asarray(boxes)
     low, width = boxes[:, :, 0], boxes[:, :, 1]-boxes[:, :, 0]
-    grasp = low + width*np.array([[.65, .08, .40], [.65, .92, .40]])
-    carry = low + width*np.array([[.50, .08, .70], [.50, .92, .70]])
-    place = low + width*np.array([[.80, .08, .20], [.80, .92, .20]])
-    velocity = np.array([.25, 0., 0.])
+    approach = low + width*np.array([[.85, .76, .10], [.85, .24, .10]])
+    grasp = low + width*np.array([[1., .04, .10], [1., .96, .10]])
+    carry = low + width*np.array([[.40, .12, 1.], [.40, .88, 1.]])
+    present = low + width*np.array([[1., .12, 1.], [1., .88, 1.]])
+    place = grasp.copy()
+    release = low + width*np.array([[1., .76, .10], [1., .24, .10]])
+    # Exact box edges can round a few ulps above the configured upper bound.
+    for goal in (approach, grasp, carry, present, place, release):
+        np.clip(goal, low, boxes[:, :, 1], out=goal)
+    velocity = np.array([.35, 0., 0.])
     limits = np.asarray(velocity_ranges)
     if (velocity < limits[:, 0]).any() or (velocity > limits[:, 1]).any():
         raise ValueError("Demo walking velocity is outside configured limits")
     def stage(name, move, hold, command, palms, masks, disable=()):
         return Stage(name, move*time_scale, hold*time_scale, np.asarray(command, dtype=float),
                      np.array(palms, dtype=float), np.array(masks, dtype=float), disable)
-    stages = [
-        stage("demo_stand", .2, .4, [0, 0, 0], rest, [0, 0]),
-        stage("demo_reach_to_grasp", 1.6, .3, [0, 0, 0], grasp, [1, 1]),
-        stage("demo_lift_to_carry", .8, .2, [0, 0, 0], carry, [1, 1]),
-        stage("demo_walk_carrying", .8, 1.4, velocity, carry, [1, 1]),
-        stage("demo_stop", .8, .4, [0, 0, 0], carry, [1, 1]),
-        stage("demo_place", 1.2, .3, [0, 0, 0], place, [1, 1]),
-        stage("demo_withdraw_release", 1.4, .2, [0, 0, 0], rest, [1, 1], (0, 1)),
-        stage("demo_stand_finish", .2, .6, [0, 0, 0], rest, [0, 0]),
+    return [
+        stage("demo_stand", .3, .7, [0, 0, 0], rest, [0, 0]),
+        stage("demo_open_approach", 1.8, .4, [0, 0, 0], approach, [1, 1]),
+        stage("demo_reach_to_grasp", 1.2, .5, [0, 0, 0], grasp, [1, 1]),
+        stage("demo_lift_to_carry", 1.8, .6, [0, 0, 0], carry, [1, 1]),
+        stage("demo_walk_carrying", 1.2, 3.6, velocity, carry, [1, 1]),
+        stage("demo_stop", 1., .8, [0, 0, 0], carry, [1, 1]),
+        stage("demo_present_forward", 1.5, .4, [0, 0, 0], present, [1, 1]),
+        stage("demo_place", 1.8, .6, [0, 0, 0], place, [1, 1]),
+        stage("demo_open_release", 1.2, .5, [0, 0, 0], release, [1, 1]),
+        stage("demo_withdraw_release", 1.8, .3, [0, 0, 0], rest, [1, 1], (0, 1)),
+        stage("demo_stand_finish", .3, .7, [0, 0, 0], rest, [0, 0]),
     ]
-    if RAMP_DURATION+sum(s.move_s+s.hold_s for s in stages) > 14.8+1e-9:
-        raise ValueError("Demo exceeds its 15-second budget including startup; use --time-scale <= 1")
-    return stages
 
 
 def add_physical_reach(stages, boxes, goals, time_scale=1.):
@@ -337,7 +344,7 @@ def main(default_profile="physical"):
     parser.add_argument("onnx_path")
     parser.add_argument("--robot-xml")
     parser.add_argument("--reach-profile", choices=("physical", "standard", "demo"), default=default_profile,
-                        help="physical: reach stress test; standard: original protocol; demo: grasp/carry/place in under 15 s including startup")
+                        help="physical: reach stress test; standard: original protocol; demo: expressive grasp/carry/place (~27 s including startup)")
     parser.add_argument("--reach-samples", type=int, default=8192, help="FK samples per arm to estimate directional reach limits")
     parser.add_argument("--reach-seed", type=int, default=7)
     parser.add_argument("--time-scale", type=float, default=1., help="Multiply all move/hold times; 1.5 is slower")

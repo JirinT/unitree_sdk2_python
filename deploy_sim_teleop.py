@@ -139,8 +139,12 @@ class TeleopThread(threading.Thread):
             tty.setcbreak(fd)
             print("\nKeyboard: focus this terminal; tap keys, no Enter needed.")
             print("W/S forward/back; Q/E strafe; Z/X yaw; B or Space STOP walking.")
-            print("1 left / 2 right / 3 both hands; I/K X, J/L Y, U/O Z (2 cm).")
-            print("4/5 toggle left/right; 0 both off; C center selected targets. Ctrl+C exits.")
+            if hasattr(self.runner.controls, "help_lines"):
+                for line in self.runner.controls.help_lines:
+                    print(line)
+            else:
+                print("1 left / 2 right / 3 both hands; I/K X, J/L Y, U/O Z (2 cm).")
+                print("4/5 toggle left/right; 0 both off; C center selected targets. Ctrl+C exits.")
             print("Walking is latched until changed/stopped; hands start disabled.\n")
             while not self.runner.stop_event.is_set():
                 if not select.select([fd], [], [], .05)[0]:
@@ -171,6 +175,12 @@ class TeleopThread(threading.Thread):
 
 
 class PolicyRunner:
+    OBS_DIM = 112
+    ACTOR_OBS_ORDER = ACTOR_OBS_ORDER
+
+    def _make_controls(self, cfg):
+        return KeyboardCommands((cfg["left_hand_ranges"], cfg["right_hand_ranges"]), cfg["velocity_ranges"])
+
     def __init__(self, deploy_yaml, onnx_path, simulation=False, robot_xml=None):
         self.simulation = simulation
         path = Path(deploy_yaml).resolve()
@@ -196,8 +206,8 @@ class PolicyRunner:
                 or not math.isfinite(self.gait_period) or self.gait_period <= 0):
             raise ValueError("step_dt must be >= control dt and gait_period positive")
         self.obs_dim = int(cfg["obs_dim"])
-        if self.obs_dim != 11 + 3*self.n + 20 or cfg.get("actor_obs_order") != ACTOR_OBS_ORDER:
-            raise ValueError("Use deploy_hand_tracking.yaml: the current flat hand actor requires 112 values in its trained order")
+        if self.obs_dim != self.OBS_DIM or cfg.get("actor_obs_order") != self.ACTOR_OBS_ORDER:
+            raise ValueError(f"The selected flat actor requires {self.OBS_DIM} values in its trained order; use its matching deployment YAML")
         self.obs_scales = {key: float(cfg.get(name, 1.0)) for key, name in (
             ("lin_vel", "obs_scale_lin_vel"), ("ang_vel", "obs_scale_ang_vel"),
             ("dof_pos", "obs_scale_dof_pos"), ("dof_vel", "obs_scale_dof_vel"))}
@@ -214,7 +224,7 @@ class PolicyRunner:
         self.imu_quaternion_frame = cfg.get("imu_quaternion_frame", "imu")
         if self.imu_quaternion_frame not in {"imu", "pelvis"}:
             raise ValueError("imu_quaternion_frame must be imu or pelvis, matching the validator's imu_quat sensor")
-        self.controls = KeyboardCommands((cfg["left_hand_ranges"], cfg["right_hand_ranges"]), cfg["velocity_ranges"])
+        self.controls = self._make_controls(cfg)
         self.session = onnxruntime.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
         inputs, outputs = self.session.get_inputs(), self.session.get_outputs()
         if (len(inputs) != 1 or len(outputs) != 1 or len(inputs[0].shape) != 2
@@ -222,12 +232,12 @@ class PolicyRunner:
                 or outputs[0].shape[1] != self.n
                 or (isinstance(inputs[0].shape[0], int) and inputs[0].shape[0] != 1)
                 or (isinstance(outputs[0].shape[0], int) and outputs[0].shape[0] != 1)):
-            raise ValueError("Expected feedforward ONNX [1,112] -> [1,27]; export the current Flat-HandTracking actor")
+            raise ValueError(f"Expected feedforward ONNX [1,{self.OBS_DIM}] -> [1,27]; export the matching flat actor")
         if inputs[0].type != "tensor(float)":
             raise ValueError("Expected float32 ONNX actor input")
         self.in_name = inputs[0].name
         metadata = self.session.get_modelmeta().custom_metadata_map
-        for key, expected in (("observation_names", ACTOR_OBS_ORDER), ("joint_names", self.joint_names)):
+        for key, expected in (("observation_names", self.ACTOR_OBS_ORDER), ("joint_names", self.joint_names)):
             if key in metadata and metadata[key].split(",") != expected:
                 raise ValueError(f"ONNX {key} do not match the deployment config; export the latest actor")
         for key, expected in (("default_joint_pos", self.default_q), ("action_scale", self.action_scale),
